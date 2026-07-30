@@ -142,7 +142,13 @@ def find_logs(paths: list[str]) -> list[str]:
 
   if not out:
     raise SystemExit(f"no rlogs found for {paths} (qlogs are too decimated for this)")
-  return sorted(out)
+  return sorted(out, key=segment_key)
+
+
+def segment_key(path: str) -> tuple[str, int]:
+  """segments must run in numeric order: sorting `--10` before `--2` scrambles the time axis"""
+  route, _, seg = os.path.basename(os.path.dirname(path)).rpartition("--")
+  return (route, int(seg) if seg.isdigit() else -1)
 
 
 @dataclass
