@@ -223,32 +223,55 @@ class CanDecoder:
       row.lkas_torque = self._torque(self.tx, "tx", evt.logMonoTime, frames)
 
 
-def find_dbc_name(paths: list[str]) -> str | None:
-  """carParams is re-logged at every segment start, so the platform's pt DBC is in the log itself."""
-  from opendbc.car.values import PLATFORMS
+def describe_route(paths: list[str]) -> str | None:
+  """Which fork and which car produced this data: comparing runs is meaningless without it."""
+  fp = None
+  branch = commit = version = ""
 
   for evt in read_log(paths[0]):
-    if evt.which() == "carParams":
+    which = evt.which()
+    if which == "initData":
+      init = evt.initData
+      branch, commit, version = init.gitBranch, init.gitCommit[:9], init.version
+    elif which == "carParams":
       fp = evt.carParams.carFingerprint
-      platform = PLATFORMS.get(fp)
-      if platform is None:
-        raise SystemExit(f"unknown platform {fp!r}, pass --dbc")
-      dbcs = [v for k, v in platform.config.dbc_dict.items() if str(k).endswith("pt")]
-      if not dbcs:
-        raise SystemExit(f"{fp} has no powertrain DBC, pass --dbc")
-      print(f"# {fp}, decoding STEER_STATUS from {dbcs[0]}")
-      return dbcs[0]
-  return None
+    if fp and branch:
+      break
+
+  if branch or version:
+    print(f"# recorded on {branch or '?'} @ {commit or '?'} (v{version or '?'})")
+  if fp:
+    print(f"# car fingerprinted as {fp}")
+  return fp
+
+
+def find_dbc_name(fp: str | None) -> str:
+  """The fingerprint comes from the log's own carParams, so a supported car needs no argument."""
+  from opendbc.car.values import PLATFORMS
+
+  if fp is None:
+    raise SystemExit("no carParams in the log, pass --dbc")
+
+  platform = PLATFORMS.get(fp)
+  if platform is None:
+    raise SystemExit(f"unknown platform {fp!r}, pass --dbc")
+
+  dbcs = [v for k, v in platform.config.dbc_dict.items() if str(k).endswith("pt")]
+  if not dbcs:
+    raise SystemExit(f"{fp} has no powertrain DBC, pass --dbc")
+
+  print(f"# decoding CAN with {dbcs[0]}")
+  return dbcs[0]
 
 
 def extract_rows(paths: list[str], steer_status: bool = False, dbc: str | None = None,
-                 stock_torque: bool = False) -> list[Row]:
+                 stock_torque: bool = False, fp: str | None = None) -> list[Row]:
   """controlsState runs at 100 Hz, so emit one row per controlsState and carry the rest forward."""
   rows: list[Row] = []
   cur = Row()
   t0 = None
 
-  decoder = CanDecoder(dbc or find_dbc_name(paths), stock_torque) if (steer_status or stock_torque) else None
+  decoder = CanDecoder(dbc or find_dbc_name(fp), stock_torque) if (steer_status or stock_torque) else None
 
   for path in paths:
     for evt in read_log(path):
@@ -465,7 +488,8 @@ def main() -> None:
 
   paths = find_logs(args.paths)
   print(f"# reading {len(paths)} rlog(s)", file=sys.stderr)
-  rows = extract_rows(paths, args.steer_status or args.stock_torque, args.dbc, args.stock_torque)
+  fp = describe_route(paths)
+  rows = extract_rows(paths, args.steer_status or args.stock_torque, args.dbc, args.stock_torque, fp)
   if not rows:
     raise SystemExit("no controlsState in these logs")
 
