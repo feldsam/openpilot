@@ -188,10 +188,19 @@ class CanDecoder:
 
     self.status = CANParser(dbc_name, [("STEER_STATUS", 0)], 0)
     self.values = defaultdict(lambda: "UNKNOWN", CANDefine(dbc_name).dv["STEER_STATUS"]["STEER_STATUS"])
-    # openpilot transmits LKAS on bus 0, the factory camera sits on bus 2
-    self.lkas = {bus: CANParser(dbc_name, [("STEERING_CONTROL", 0)], bus) for bus in (0, 2)} if stock_torque else {}
-    self.addresses = set(self.status.addresses) | {a for p in self.lkas.values() for a in p.addresses}
-    self.last_seen: dict[int, int] = {}
+    # openpilot's own commands are in sendcan on the lkas bus; the factory camera sits on bus 2 of can
+    self.tx = CANParser(dbc_name, [("STEERING_CONTROL", 0)], 0) if stock_torque else None
+    self.camera = CANParser(dbc_name, [("STEERING_CONTROL", 0)], 2) if stock_torque else None
+    self.addresses = set(self.status.addresses) | (set(self.camera.addresses) if self.camera else set())
+    self.last_seen: dict[str, int] = {}
+
+  def _torque(self, parser, key: str, t: int, frames: list) -> float:
+    if parser.update([[t, frames]]):
+      self.last_seen[key] = t
+    # the camera stops transmitting once the relay closes, so a held value would read as live torque
+    if t - self.last_seen.get(key, 0) > STALE_CAN_NANOS:
+      return 0.0
+    return parser.vl["STEERING_CONTROL"]["STEER_TORQUE"]
 
   def update(self, evt, row: "Row") -> None:
     frames = [(c.address, c.dat, c.src) for c in evt.can if c.address in self.addresses]
@@ -202,16 +211,16 @@ class CanDecoder:
     self.status.update([[t, frames]])
     row.steer_status = self.values[int(self.status.vl["STEER_STATUS"]["STEER_STATUS"])]
 
-    for bus, parser in self.lkas.items():
-      if parser.update([[t, frames]]):
-        self.last_seen[bus] = t
-      # the camera stops transmitting once the relay closes, so a held value would read as live torque
-      stale = t - self.last_seen.get(bus, 0) > STALE_CAN_NANOS
-      torque = 0.0 if stale else parser.vl["STEERING_CONTROL"]["STEER_TORQUE"]
-      if bus == 0:
-        row.lkas_torque = torque
-      else:
-        row.stock_torque = torque
+    if self.camera is not None:
+      row.stock_torque = self._torque(self.camera, "camera", t, frames)
+
+  def update_sendcan(self, evt, row: "Row") -> None:
+    """what openpilot actually transmitted: the can stream only carries what the panda received"""
+    if self.tx is None:
+      return
+    frames = [(c.address, c.dat, c.src) for c in evt.sendcan if c.address in self.tx.addresses]
+    if frames:
+      row.lkas_torque = self._torque(self.tx, "tx", evt.logMonoTime, frames)
 
 
 def find_dbc_name(paths: list[str]) -> str | None:
@@ -247,6 +256,8 @@ def extract_rows(paths: list[str], steer_status: bool = False, dbc: str | None =
 
       if which == "can" and decoder is not None:
         decoder.update(evt, cur)
+      elif which == "sendcan" and decoder is not None:
+        decoder.update_sendcan(evt, cur)
       elif which == "carOutput":
         cur.torque_out = evt.carOutput.actuatorsOutput.torque
       elif which == "carState":
@@ -421,7 +432,7 @@ def report_stock_torque(rows: list[Row]) -> None:
   stock_on = [r.stock_torque for r in rows if r.lat_active and r.stock_torque]
 
   print("\nSTEERING_CONTROL STEER_TORQUE on the bus:\n")
-  print(f"  openpilot,      engaged (bus 0):  {stats(op)}")
+  print(f"  openpilot,      engaged (sendcan):  {stats(op)}")
   print(f"  factory camera, openpilot off (bus 2):  {stats(stock_off)}")
   print(f"  factory camera, openpilot engaged (bus 2):  {stats(stock_on)}")
   print("\n# the factory number is only meaningful if the stock LKAS actually actuated;")
