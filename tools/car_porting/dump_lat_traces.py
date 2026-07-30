@@ -55,6 +55,7 @@ CLIP_EPS = 2e-4  # 1/m, ignore float noise when comparing requested against used
 CORNER_MIN_CURVATURE = 0.01  # 1/m, ~100 m radius
 CORNER_MIN_DURATION = 0.8  # s
 CORNER_MERGE_GAP = 0.5  # s
+STALE_CAN_NANOS = int(0.5e9)  # treat a message as gone if it has not been seen for this long
 
 
 def load_log_schema():
@@ -170,26 +171,47 @@ class Row:
   steer_ratio: float = 0.0
   confidence: float = 1.0
   steer_status: str = ""  # only filled with --steer-status
+  lkas_torque: float = 0.0  # STEERING_CONTROL on the bus, openpilot's own
+  stock_torque: float = 0.0  # STEERING_CONTROL from the factory camera, only with --stock-torque
 
   @property
   def clipped(self) -> bool:
     return abs(self.curv_req) - abs(self.curv_used) > CLIP_EPS
 
 
-def steer_status_decoder(dbc_name: str | None):
-  """Honda reports LOW_SPEED_LOCKOUT in STEER_STATUS and openpilot treats it as benign, so a car
-  silently ignoring torque at low speed is only visible on the bus."""
-  from opendbc.can import CANDefine, CANParser
+class CanDecoder:
+  """Signals that only exist on the bus: the EPS status openpilot discards, and what the factory
+  camera commands when the relay is open and it still has the car."""
 
-  def decode(evt):
-    frames = [(c.address, c.dat, c.src) for c in evt.can if c.address in parser.addresses]
-    if frames:
-      parser.update([[evt.logMonoTime, frames]])
-    return values[int(parser.vl["STEER_STATUS"]["STEER_STATUS"])]
+  def __init__(self, dbc_name: str, stock_torque: bool = False):
+    from opendbc.can import CANDefine, CANParser
 
-  parser = CANParser(dbc_name, [("STEER_STATUS", 0)], 0)
-  values = defaultdict(lambda: "UNKNOWN", CANDefine(dbc_name).dv["STEER_STATUS"]["STEER_STATUS"])
-  return decode
+    self.status = CANParser(dbc_name, [("STEER_STATUS", 0)], 0)
+    self.values = defaultdict(lambda: "UNKNOWN", CANDefine(dbc_name).dv["STEER_STATUS"]["STEER_STATUS"])
+    # openpilot transmits LKAS on bus 0, the factory camera sits on bus 2
+    self.lkas = {bus: CANParser(dbc_name, [("STEERING_CONTROL", 0)], bus) for bus in (0, 2)} if stock_torque else {}
+    self.addresses = set(self.status.addresses) | {a for p in self.lkas.values() for a in p.addresses}
+    self.last_seen: dict[int, int] = {}
+
+  def update(self, evt, row: "Row") -> None:
+    frames = [(c.address, c.dat, c.src) for c in evt.can if c.address in self.addresses]
+    if not frames:
+      return
+
+    t = evt.logMonoTime
+    self.status.update([[t, frames]])
+    row.steer_status = self.values[int(self.status.vl["STEER_STATUS"]["STEER_STATUS"])]
+
+    for bus, parser in self.lkas.items():
+      if parser.update([[t, frames]]):
+        self.last_seen[bus] = t
+      # the camera stops transmitting once the relay closes, so a held value would read as live torque
+      stale = t - self.last_seen.get(bus, 0) > STALE_CAN_NANOS
+      torque = 0.0 if stale else parser.vl["STEERING_CONTROL"]["STEER_TORQUE"]
+      if bus == 0:
+        row.lkas_torque = torque
+      else:
+        row.stock_torque = torque
 
 
 def find_dbc_name(paths: list[str]) -> str | None:
@@ -210,20 +232,21 @@ def find_dbc_name(paths: list[str]) -> str | None:
   return None
 
 
-def extract_rows(paths: list[str], steer_status: bool = False, dbc: str | None = None) -> list[Row]:
+def extract_rows(paths: list[str], steer_status: bool = False, dbc: str | None = None,
+                 stock_torque: bool = False) -> list[Row]:
   """controlsState runs at 100 Hz, so emit one row per controlsState and carry the rest forward."""
   rows: list[Row] = []
   cur = Row()
   t0 = None
 
-  decode = steer_status_decoder(dbc or find_dbc_name(paths)) if steer_status else None
+  decoder = CanDecoder(dbc or find_dbc_name(paths), stock_torque) if (steer_status or stock_torque) else None
 
   for path in paths:
     for evt in read_log(path):
       which = evt.which()
 
-      if which == "can" and decode is not None:
-        cur.steer_status = decode(evt)
+      if which == "can" and decoder is not None:
+        decoder.update(evt, cur)
       elif which == "carOutput":
         cur.torque_out = evt.carOutput.actuatorsOutput.torque
       elif which == "carState":
@@ -385,6 +408,26 @@ def report(corners: list[Corner]) -> None:
       print(f"{f'{lo}-{hi} km/h':>12}  " + "  ".join(cells))
 
 
+def report_stock_torque(rows: list[Row]) -> None:
+  """If the factory camera ever commands more than openpilot's STEER_MAX, the cap is ours, not the car's."""
+  def stats(vals: list[float]) -> str:
+    vals = sorted(abs(v) for v in vals)
+    if not vals:
+      return "never commanded torque"
+    return f"max {vals[-1]:5.0f}, p99 {vals[int(len(vals) * 0.99)]:5.0f}, nonzero {len(vals)} samples"
+
+  op = [r.lkas_torque for r in rows if r.lat_active and r.lkas_torque]
+  stock_off = [r.stock_torque for r in rows if not r.lat_active and r.stock_torque]
+  stock_on = [r.stock_torque for r in rows if r.lat_active and r.stock_torque]
+
+  print("\nSTEERING_CONTROL STEER_TORQUE on the bus:\n")
+  print(f"  openpilot,      engaged (bus 0):  {stats(op)}")
+  print(f"  factory camera, openpilot off (bus 2):  {stats(stock_off)}")
+  print(f"  factory camera, openpilot engaged (bus 2):  {stats(stock_on)}")
+  print("\n# the factory number is only meaningful if the stock LKAS actually actuated;")
+  print("# if it exceeds openpilot's STEER_MAX, the car accepts more torque than we ask for")
+
+
 def write_csv(path: str, rows: list[Row]) -> None:
   import csv
   cols = list(Row().__dict__.keys()) + ["clipped"]
@@ -404,12 +447,14 @@ def main() -> None:
                  help=f"corner detection threshold in 1/m (default {CORNER_MIN_CURVATURE}, ~100 m radius)")
   p.add_argument("--steer-status", action="store_true",
                  help="decode EPS STEER_STATUS off the bus (needs opendbc, and parsing raw CAN is slow)")
+  p.add_argument("--stock-torque", action="store_true",
+                 help="compare openpilot's LKAS torque against what the factory camera commands on the camera bus")
   p.add_argument("--dbc", help="DBC to decode with (default: look up the platform from carParams)")
   args = p.parse_args()
 
   paths = find_logs(args.paths)
   print(f"# reading {len(paths)} rlog(s)", file=sys.stderr)
-  rows = extract_rows(paths, args.steer_status, args.dbc)
+  rows = extract_rows(paths, args.steer_status or args.stock_torque, args.dbc, args.stock_torque)
   if not rows:
     raise SystemExit("no controlsState in these logs")
 
@@ -421,6 +466,9 @@ def main() -> None:
     report(corners)
   else:
     print(f"\nno corners above {args.min_curvature} 1/m while engaged")
+
+  if args.stock_torque:
+    report_stock_torque(rows)
 
   if args.csv:
     write_csv(args.csv, rows)
