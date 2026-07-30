@@ -97,7 +97,11 @@ def main() -> None:
   lp_raw = read_param("LiveParametersV2")
   if lp_raw is not None:
     try:
-      from cereal import log
+      # cereal is `openpilot.cereal` in the current layout, bare `cereal` in older forks
+      try:
+        from openpilot.cereal import log
+      except ImportError:
+        from cereal import log
       lp = _read_struct(log.Event, lp_raw).liveParameters
       print()
       print(f"# learned steerRatio      : {lp.steerRatio:.3f} (valid={lp.steerRatioValid})")
