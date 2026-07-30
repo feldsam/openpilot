@@ -43,7 +43,7 @@ def load_car_params(raw: bytes):
       if mod == "cereal":
         struct = struct.CarParams
       return _read_struct(struct, raw)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
       errors.append(f"{mod}: {e}")
   raise SystemExit("Could not parse CarParams:\n  " + "\n  ".join(errors))
 
@@ -61,8 +61,7 @@ def main() -> None:
 
   raw = read_param("CarParamsPersistent") or read_param("CarParams")
   if raw is None:
-    raise SystemExit(f"No CarParamsPersistent/CarParams in {PARAMS_DIR}. Drive the car once first, "
-                     f"or set PARAMS_DIR.")
+    raise SystemExit(f"No CarParamsPersistent/CarParams in {PARAMS_DIR}. Drive the car once first, or set PARAMS_DIR.")
 
   CP = load_car_params(raw)
 
@@ -107,7 +106,7 @@ def main() -> None:
       print(f"# learned steerRatio      : {lp.steerRatio:.3f} (valid={lp.steerRatioValid})")
       print(f"# learned stiffnessFactor : {lp.stiffnessFactor:.3f} (valid={lp.stiffnessFactorValid})")
       print(f"# learned angleOffsetAvg  : {lp.angleOffsetAverageDeg:.3f} deg")
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
       print(f"\n# could not read LiveParametersV2: {e}")
 
 
