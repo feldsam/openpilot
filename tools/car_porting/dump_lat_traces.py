@@ -32,6 +32,7 @@ import bz2
 import os
 import subprocess
 import sys
+from collections import defaultdict
 from dataclasses import dataclass, field
 
 # make `cereal`/`openpilot` importable when run directly over SSH, where the launch
@@ -154,30 +155,72 @@ class Row:
   curv_actual: float = 0.0  # measured, from the vehicle model
   angle_des: float = 0.0
   angle_act: float = 0.0
-  output: float = 0.0
+  output: float = 0.0  # lateral controller output, before the car's rate limits
+  torque_out: float = 0.0  # what actually went out after them
   saturated: bool = False
   pressed: bool = False
   driver_torque: float = 0.0
   roll: float = 0.0
   steer_ratio: float = 0.0
   confidence: float = 1.0
+  steer_status: str = ""  # only filled with --steer-status
 
   @property
   def clipped(self) -> bool:
     return abs(self.curv_req) - abs(self.curv_used) > CLIP_EPS
 
 
-def extract_rows(paths: list[str]) -> list[Row]:
+def steer_status_decoder(dbc_name: str | None):
+  """Honda reports LOW_SPEED_LOCKOUT in STEER_STATUS and openpilot treats it as benign, so a car
+  silently ignoring torque at low speed is only visible on the bus."""
+  from opendbc.can import CANDefine, CANParser
+
+  def decode(evt):
+    frames = [(c.address, c.dat, c.src) for c in evt.can if c.address in parser.addresses]
+    if frames:
+      parser.update([[evt.logMonoTime, frames]])
+    return values[int(parser.vl["STEER_STATUS"]["STEER_STATUS"])]
+
+  parser = CANParser(dbc_name, [("STEER_STATUS", 0)], 0)
+  values = defaultdict(lambda: "UNKNOWN", CANDefine(dbc_name).dv["STEER_STATUS"]["STEER_STATUS"])
+  return decode
+
+
+def find_dbc_name(paths: list[str]) -> str | None:
+  """carParams is re-logged at every segment start, so the platform's pt DBC is in the log itself."""
+  from opendbc.car.values import PLATFORMS
+
+  for evt in read_log(paths[0]):
+    if evt.which() == "carParams":
+      fp = evt.carParams.carFingerprint
+      platform = PLATFORMS.get(fp)
+      if platform is None:
+        raise SystemExit(f"unknown platform {fp!r}, pass --dbc")
+      dbcs = [v for k, v in platform.config.dbc_dict.items() if str(k).endswith("pt")]
+      if not dbcs:
+        raise SystemExit(f"{fp} has no powertrain DBC, pass --dbc")
+      print(f"# {fp}, decoding STEER_STATUS from {dbcs[0]}")
+      return dbcs[0]
+  return None
+
+
+def extract_rows(paths: list[str], steer_status: bool = False, dbc: str | None = None) -> list[Row]:
   """controlsState runs at 100 Hz, so emit one row per controlsState and carry the rest forward."""
   rows: list[Row] = []
   cur = Row()
   t0 = None
 
+  decode = steer_status_decoder(dbc or find_dbc_name(paths)) if steer_status else None
+
   for path in paths:
     for evt in read_log(path):
       which = evt.which()
 
-      if which == "carState":
+      if which == "can" and decode is not None:
+        cur.steer_status = decode(evt)
+      elif which == "carOutput":
+        cur.torque_out = evt.carOutput.actuatorsOutput.torque
+      elif which == "carState":
         cs = evt.carState
         cur.v_ego = cs.vEgo
         cur.pressed = cs.steeringPressed
@@ -252,10 +295,17 @@ class Corner:
     if track is not None and track < 0.90:
       out.append(f"STEERING UNDER-DELIVERS (achieved {track * 100:.0f}% of commanded angle)")
     if self.frac(lambda r: abs(r.output) > 0.99) > 0.1:
-      out.append("TORQUE OUTPUT AT LIMIT")
+      applied = self.frac(lambda r: abs(r.torque_out) > 0.99)
+      out.append(f"TORQUE OUTPUT AT LIMIT (reached the car {applied * 100:.0f}% of the time)")
+    if self.statuses(exclude_normal=True):
+      out.append("EPS: " + ", ".join(sorted(self.statuses(exclude_normal=True))))
     if self.frac(lambda r: r.pressed) > 0.5:
       out.append("driver was steering, ignore")
     return out or ["ok"]
+
+  def statuses(self, exclude_normal: bool = False) -> set[str]:
+    seen = {r.steer_status for r in self.rows if r.steer_status}
+    return seen - {"NORMAL"} if exclude_normal else seen
 
 
 def find_corners(rows: list[Row], min_curvature: float) -> list[Corner]:
@@ -316,6 +366,18 @@ def report(corners: list[Corner]) -> None:
     gate = f"below {SAT_CHECK_MIN_SPEED * 3.6:.0f} km/h, where the 'Turn Exceeds Steering Limit' alert is suppressed"
     print(f"# {len(silent)}/{len(clipped)} clipped corners were {gate}")
 
+  statuses = sorted({st for c in corners for st in c.statuses()})
+  if statuses:
+    print("\nEPS STEER_STATUS while engaged, by speed:\n")
+    buckets = [(0, 20), (20, 30), (30, 40), (40, 200)]
+    print(f"{'speed':>12}  " + "  ".join(f"{st:>22}" for st in statuses))
+    for lo, hi in buckets:
+      rows = [r for c in corners for r in c.rows if lo <= r.v_ego * 3.6 < hi and r.steer_status]
+      if not rows:
+        continue
+      cells = [f"{sum(1 for r in rows if r.steer_status == st) / len(rows) * 100:21.0f}%" for st in statuses]
+      print(f"{f'{lo}-{hi} km/h':>12}  " + "  ".join(cells))
+
 
 def write_csv(path: str, rows: list[Row]) -> None:
   import csv
@@ -334,11 +396,14 @@ def main() -> None:
   p.add_argument("--csv", help="also dump every sample to this CSV")
   p.add_argument("--min-curvature", type=float, default=CORNER_MIN_CURVATURE,
                  help=f"corner detection threshold in 1/m (default {CORNER_MIN_CURVATURE}, ~100 m radius)")
+  p.add_argument("--steer-status", action="store_true",
+                 help="decode EPS STEER_STATUS off the bus (needs opendbc, and parsing raw CAN is slow)")
+  p.add_argument("--dbc", help="DBC to decode with (default: look up the platform from carParams)")
   args = p.parse_args()
 
   paths = find_logs(args.paths)
   print(f"# reading {len(paths)} rlog(s)", file=sys.stderr)
-  rows = extract_rows(paths)
+  rows = extract_rows(paths, args.steer_status, args.dbc)
   if not rows:
     raise SystemExit("no controlsState in these logs")
 
