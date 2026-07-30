@@ -20,6 +20,10 @@ Optionally pass a platform name to label the output:
 import os
 import sys
 
+# make `cereal`/`openpilot` importable when run directly over SSH, where the launch
+# script's PYTHONPATH isn't set (python only adds the *script's* dir, not the repo root)
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
 PARAMS_DIR = os.environ.get("PARAMS_DIR", "/data/params/d")
 
 
