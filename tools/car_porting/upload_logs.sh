@@ -37,10 +37,11 @@ cd "$REALDATA"
 
 route="${1:-}"
 if [ -z "$route" ]; then
-  # newest segment directory wins; strip the trailing --N to get the route
-  newest=$(ls -1dt -- */ 2>/dev/null | head -1) || true
-  [ -n "$newest" ] || { echo "no routes in $REALDATA" >&2; exit 1; }
-  route=$(basename "$newest" | sed 's/--[0-9]*$//')
+  # newest segment directory wins; strip the trailing --N to get the route.
+  # the log root also holds boot/ and crash/, so match only <route>--<segment>.
+  newest=$(ls -1dt -- */ 2>/dev/null | sed 's:/$::' | grep -E -- '--[0-9]+$' | head -1) || true
+  [ -n "$newest" ] || { echo "no route segments in $REALDATA" >&2; exit 1; }
+  route=${newest%--*}
   echo "# no route given, using newest: $route"
 fi
 shift || true
