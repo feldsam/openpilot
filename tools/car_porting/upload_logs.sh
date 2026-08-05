@@ -8,6 +8,7 @@
 #   ./upload_logs.sh                          # newest route
 #   ./upload_logs.sh 00000003--a1b2c3d4e5     # a specific route
 #   ./upload_logs.sh 00000003--a1b2c3d4e5 4 5 6   # only those segments
+#   ./upload_logs.sh -s                       # send every segment the destination lacks
 #   ./upload_logs.sh -a <route>               # include qlogs and camera files
 #   ./upload_logs.sh -d <route>               # dry run, just report what would go
 #   DEST=user@host:/path ./upload_logs.sh     # somewhere else
@@ -21,12 +22,14 @@ DEST="${DEST:-feldsam@185.174.169.39:~/prelude-logs}"
 
 names=(rlog.zst rlog.bz2 rlog)
 dry_run=0
+sync_all=0
 
-while getopts "adh" opt; do
+while getopts "adsh" opt; do
   case "$opt" in
     a) names+=(qlog.zst qlog.bz2 qlog qcamera.ts fcamera.hevc ecamera.hevc dcamera.hevc) ;;
     d) dry_run=1 ;;
-    h) sed -n '2,20p' "$0"; exit 0 ;;
+    s) sync_all=1 ;;
+    h) sed -n '2,22p' "$0"; exit 0 ;;
     *) exit 1 ;;
   esac
 done
@@ -34,6 +37,45 @@ shift $((OPTIND - 1))
 
 [ -d "$REALDATA" ] || { echo "no $REALDATA (run this on the device, or set REALDATA)" >&2; exit 1; }
 cd "$REALDATA"
+
+case "$DEST" in
+  *:*) remote_host="${DEST%%:*}"; remote_path="${DEST#*:}" ;;
+  *)   remote_host=""; remote_path="$DEST" ;;   # local path, for testing
+esac
+
+list_dest() {
+  if [ -n "$remote_host" ]; then
+    ssh "$remote_host" "ls -1 $remote_path 2>/dev/null" 2>/dev/null || true
+  else
+    ls -1 "$remote_path" 2>/dev/null || true
+  fi
+}
+
+if [ "$sync_all" -eq 1 ]; then
+  have=$(list_dest)
+  files=()
+  segs=0
+  for d in $(ls -1d -- */ 2>/dev/null | sed 's:/$::' | grep -E -- '--[0-9]+$' | sort); do
+    printf '%s\n' "$have" | grep -qxF "$d" && continue
+    added=0
+    for name in "${names[@]}"; do
+      [ -f "$d/$name" ] && { files+=("$d/$name"); added=1; }
+    done
+    [ "$added" -eq 1 ] && segs=$((segs + 1))
+  done
+  [ "${#files[@]}" -gt 0 ] || { echo "# destination already has every segment"; exit 0; }
+  size=$(du -ch "${files[@]}" | tail -1 | cut -f1)
+  echo "# sync: ${#files[@]} files across $segs new segments, $size"
+  echo "# -> $DEST"
+  if [ "$dry_run" -eq 1 ]; then printf '%s\n' "${files[@]}"; exit 0; fi
+  if [ -n "$remote_host" ]; then
+    tar cf - "${files[@]}" | ssh "$remote_host" "mkdir -p $remote_path && tar xf - -C $remote_path"
+  else
+    mkdir -p "$remote_path" && tar cf - "${files[@]}" | tar xf - -C "$remote_path"
+  fi
+  echo "# done"
+  exit 0
+fi
 
 route="${1:-}"
 if [ -z "$route" ]; then
@@ -77,9 +119,10 @@ fi
 
 # tar over ssh rather than scp: it keeps the segment directories, and rsync is not
 # installed on either end. Not resumable, so send fewer segments if the link is flaky.
-remote_host="${DEST%%:*}"
-remote_path="${DEST#*:}"
-tar cf - "${files[@]}" | \
-  ssh "$remote_host" "mkdir -p $remote_path && tar xf - -C $remote_path"
+if [ -n "$remote_host" ]; then
+  tar cf - "${files[@]}" | ssh "$remote_host" "mkdir -p $remote_path && tar xf - -C $remote_path"
+else
+  mkdir -p "$remote_path" && tar cf - "${files[@]}" | tar xf - -C "$remote_path"
+fi
 
 echo "# done"
