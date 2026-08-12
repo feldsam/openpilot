@@ -101,7 +101,16 @@ def read_log(path: str):
   elif dat.startswith(b"\x28\xb5\x2f\xfd"):
     dat = decompress_zst(dat)
 
-  return log.Event.read_multiple_bytes(dat)
+  # A partially uploaded segment truncates mid-message; read_multiple_bytes raises when it hits
+  # the cut. Yield every event that parsed and stop cleanly rather than killing the whole route.
+  reader = log.Event.read_multiple_bytes(dat)
+  while True:
+    try:
+      yield next(reader)
+    except StopIteration:
+      return
+    except Exception:  # noqa: BLE001 - truncated/corrupt tail: stop at the last good event
+      return
 
 
 def find_logs(paths: list[str]) -> list[str]:
