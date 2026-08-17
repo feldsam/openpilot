@@ -64,14 +64,16 @@ if [ "$sync_all" -eq 1 ]; then
     [ "$added" -eq 1 ] && segs=$((segs + 1))
   done
   [ "${#files[@]}" -gt 0 ] || { echo "# destination already has every segment"; exit 0; }
-  size=$(du -ch "${files[@]}" | tail -1 | cut -f1)
+  # the device's deleter frees space by removing old segments while we run, so files listed
+  # above can vanish before du/tar reach them: swallow those in du, and let tar skip them.
+  size=$(du -ch "${files[@]}" 2>/dev/null | tail -1 | cut -f1)
   echo "# sync: ${#files[@]} files across $segs new segments, $size"
   echo "# -> $DEST"
   if [ "$dry_run" -eq 1 ]; then printf '%s\n' "${files[@]}"; exit 0; fi
   if [ -n "$remote_host" ]; then
-    tar cf - "${files[@]}" | ssh "$remote_host" "mkdir -p $remote_path && tar xf - -C $remote_path"
+    tar --ignore-failed-read -cf - "${files[@]}" | ssh "$remote_host" "mkdir -p $remote_path && tar xf - -C $remote_path"
   else
-    mkdir -p "$remote_path" && tar cf - "${files[@]}" | tar xf - -C "$remote_path"
+    mkdir -p "$remote_path" && tar --ignore-failed-read -cf - "${files[@]}" | tar xf - -C "$remote_path"
   fi
   echo "# done"
   exit 0
@@ -108,7 +110,7 @@ for seg in "${segments[@]}"; do
 done
 [ "${#files[@]}" -gt 0 ] || { echo "no matching files for $route" >&2; exit 1; }
 
-size=$(du -ch "${files[@]}" | tail -1 | cut -f1)
+size=$(du -ch "${files[@]}" 2>/dev/null | tail -1 | cut -f1)
 echo "# $route: ${#files[@]} files across ${#segments[@]} segments, $size"
 echo "# -> $DEST"
 
@@ -119,10 +121,11 @@ fi
 
 # tar over ssh rather than scp: it keeps the segment directories, and rsync is not
 # installed on either end. Not resumable, so send fewer segments if the link is flaky.
+# --ignore-failed-read: the device's deleter may remove a listed segment mid-transfer.
 if [ -n "$remote_host" ]; then
-  tar cf - "${files[@]}" | ssh "$remote_host" "mkdir -p $remote_path && tar xf - -C $remote_path"
+  tar --ignore-failed-read -cf - "${files[@]}" | ssh "$remote_host" "mkdir -p $remote_path && tar xf - -C $remote_path"
 else
-  mkdir -p "$remote_path" && tar cf - "${files[@]}" | tar xf - -C "$remote_path"
+  mkdir -p "$remote_path" && tar --ignore-failed-read -cf - "${files[@]}" | tar xf - -C "$remote_path"
 fi
 
 echo "# done"
